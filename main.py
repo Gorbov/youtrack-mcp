@@ -34,6 +34,11 @@ from youtrack_mcp.config import Config, config
 from youtrack_mcp.server import YouTrackMCPServer
 from youtrack_mcp.tools.loader import load_all_tools
 
+from fastapi.responses import StreamingResponse
+import asyncio
+from typing import AsyncGenerator
+import time
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -154,6 +159,242 @@ async def list_tools():
             }
     
     return {"tools": tool_definitions}
+
+
+@app.get("/sse")
+async def sse_endpoint(request: Request):
+    """
+    SSE endpoint for n8n MCP integration.
+    Provides server-sent events stream with MCP server information and tools.
+    """
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            # Send initial connection event
+            logger.info("SSE client connected")
+            yield f"event: connection\ndata: {json.dumps({'type': 'connected', 'message': 'Connected to YouTrack MCP Server', 'version': APP_VERSION})}\n\n"
+
+            # Send server info
+            server_info = {
+                "type": "server_info",
+                "name": config.MCP_SERVER_NAME,
+                "description": config.MCP_SERVER_DESCRIPTION,
+                "version": APP_VERSION,
+                "transport": "http"
+            }
+            yield f"event: server_info\ndata: {json.dumps(server_info)}\n\n"
+
+            # Send available tools
+            if tools:
+                tool_list = []
+                for name, tool_func in tools.items():
+                    tool_info = {
+                        "name": name,
+                        "description": tool_func.__doc__ or "No description available"
+                    }
+
+                    # Add tool definition if available
+                    if hasattr(tool_func, "tool_definition"):
+                        tool_info.update(tool_func.tool_definition)
+
+                    # Extract parameter information
+                    if hasattr(tool_func, "__wrapped__") and hasattr(tool_func.__wrapped__, "__doc__"):
+                        tool_info["description"] = tool_func.__wrapped__.__doc__ or tool_info["description"]
+
+                    tool_list.append(tool_info)
+
+                tools_event = {
+                    "type": "tools",
+                    "tools": tool_list,
+                    "count": len(tool_list)
+                }
+                yield f"event: tools\ndata: {json.dumps(tools_event)}\n\n"
+                logger.info(f"Sent {len(tool_list)} tools via SSE")
+            else:
+                logger.warning("No tools available to send via SSE")
+                yield f"event: tools\ndata: {json.dumps({'type': 'tools', 'tools': [], 'count': 0})}\n\n"
+
+            # Keep connection alive with heartbeat
+            heartbeat_count = 0
+            while True:
+                if await request.is_disconnected():
+                    logger.info("SSE client disconnected")
+                    break
+
+                # Send heartbeat every 30 seconds
+                heartbeat_count += 1
+                yield f"event: heartbeat\ndata: {json.dumps({'type': 'heartbeat', 'timestamp': int(time.time()), 'count': heartbeat_count})}\n\n"
+
+                # Log heartbeat every 10th time (5 minutes)
+                if heartbeat_count % 10 == 0:
+                    logger.debug(f"SSE connection alive, sent {heartbeat_count} heartbeats")
+
+                await asyncio.sleep(30)
+
+        except asyncio.CancelledError:
+            logger.info("SSE connection cancelled")
+            raise
+        except Exception as e:
+            logger.exception("Error in SSE endpoint")
+            yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable Nginx buffering
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*"
+        }
+    )
+
+
+@app.post("/sse/execute/{tool_name}")
+async def sse_execute_tool(tool_name: str, request: Request):
+    """
+    Execute a specific tool via SSE interface.
+    This endpoint is designed for n8n MCP integration.
+
+    Args:
+        tool_name: Name of the tool to execute
+        request: The request object containing tool arguments
+
+    Returns:
+        Tool execution result in n8n-compatible format
+    """
+    try:
+        # Check if tool exists
+        if tool_name not in tools:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": f"Tool '{tool_name}' not found",
+                    "available_tools": list(tools.keys())
+                }
+            )
+
+        # Parse request body
+        body = await request.json()
+
+        # Extract arguments - n8n might send them in different formats
+        arguments = body.get("arguments", body.get("args", body.get("params", {})))
+
+        # Log for debugging
+        logger.info(f"SSE Execute: {tool_name} with arguments: {arguments}")
+
+        # Execute tool
+        try:
+            result = tools[tool_name](**arguments)
+
+            # Format response for n8n
+            response = {
+                "success": True,
+                "tool": tool_name,
+                "result": result,
+                "timestamp": int(time.time())
+            }
+
+            # If result is a string that looks like JSON, try to parse it
+            if isinstance(result, str) and result.strip().startswith('{'):
+                try:
+                    parsed_result = json.loads(result)
+                    response["result"] = parsed_result
+                except json.JSONDecodeError:
+                    # Keep original string if parsing fails
+                    pass
+
+            return response
+
+        except Exception as e:
+            logger.exception(f"Error executing tool {tool_name}")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "tool": tool_name,
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                }
+            )
+
+    except Exception as e:
+        logger.exception(f"Error in SSE execute endpoint")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.get("/sse/tools")
+async def sse_list_tools():
+    """
+    List all available tools in n8n-compatible format.
+    """
+    tool_list = []
+
+    for name, tool_func in tools.items():
+        tool_info = {
+            "name": name,
+            "description": tool_func.__doc__ or "No description available"
+        }
+
+        # Add tool definition if available
+        if hasattr(tool_func, "tool_definition"):
+            definition = tool_func.tool_definition
+            tool_info.update({
+                "parameters": definition.get("parameters", {}),
+                "returns": definition.get("returns", "Unknown")
+            })
+
+        # Try to extract parameter info from docstring
+        if hasattr(tool_func, "__wrapped__"):
+            original_func = tool_func.__wrapped__
+            if hasattr(original_func, "__doc__") and original_func.__doc__:
+                # Extract first line as description
+                lines = original_func.__doc__.strip().split('\n')
+                if lines:
+                    tool_info["description"] = lines[0].strip()
+
+        tool_list.append(tool_info)
+
+    return {
+        "tools": tool_list,
+        "count": len(tool_list),
+        "server": {
+            "name": config.MCP_SERVER_NAME,
+            "version": APP_VERSION
+        }
+    }
+
+
+@app.options("/sse")
+async def sse_options():
+    """Handle OPTIONS request for SSE endpoint."""
+    return JSONResponse(
+        content={"message": "OK"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*"
+        }
+    )
+
+
+@app.options("/sse/execute/{tool_name}")
+async def sse_execute_options(tool_name: str):
+    """Handle OPTIONS request for SSE execute endpoint."""
+    return JSONResponse(
+        content={"message": "OK"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*"
+        }
+    )
+
 
 def load_config():
     """Load configuration from environment variables or file."""
