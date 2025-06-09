@@ -193,13 +193,38 @@ async def sse_endpoint(request: Request):
                         "description": tool_func.__doc__ or "No description available"
                     }
 
-                    # Add tool definition if available
+                    # Add tool definition if available - but only serializable parts
                     if hasattr(tool_func, "tool_definition"):
-                        tool_info.update(tool_func.tool_definition)
+                        definition = tool_func.tool_definition
+                        if isinstance(definition, dict):
+                            # Only include serializable fields
+                            safe_definition = {}
+                            for key, value in definition.items():
+                                # Skip function references and other non-serializable objects
+                                if key == "function" or callable(value):
+                                    continue
+                                try:
+                                    # Test if value is JSON serializable
+                                    json.dumps(value)
+                                    safe_definition[key] = value
+                                except (TypeError, ValueError):
+                                    # Skip non-serializable values
+                                    logger.debug(f"Skipping non-serializable field {key} in tool {name}")
+                                    continue
 
-                    # Extract parameter information
+                            # Only update with safe fields
+                            if "description" in safe_definition:
+                                tool_info["description"] = safe_definition["description"]
+                            if "parameters" in safe_definition:
+                                tool_info["parameters"] = safe_definition["parameters"]
+                            if "parameter_descriptions" in safe_definition:
+                                tool_info["parameter_descriptions"] = safe_definition["parameter_descriptions"]
+
+                    # Extract parameter information from docstring
                     if hasattr(tool_func, "__wrapped__") and hasattr(tool_func.__wrapped__, "__doc__"):
-                        tool_info["description"] = tool_func.__wrapped__.__doc__ or tool_info["description"]
+                        wrapped_doc = tool_func.__wrapped__.__doc__
+                        if wrapped_doc and isinstance(wrapped_doc, str):
+                            tool_info["description"] = wrapped_doc.strip().split('\n')[0] or tool_info["description"]
 
                     tool_list.append(tool_info)
 
@@ -236,7 +261,12 @@ async def sse_endpoint(request: Request):
             raise
         except Exception as e:
             logger.exception("Error in SSE endpoint")
-            yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            error_msg = str(e)
+            # Make sure error message is also JSON serializable
+            try:
+                yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
+            except:
+                yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': 'Unknown error'})}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -341,13 +371,17 @@ async def sse_list_tools():
             "description": tool_func.__doc__ or "No description available"
         }
 
-        # Add tool definition if available
+        # Add tool definition if available - safely
         if hasattr(tool_func, "tool_definition"):
             definition = tool_func.tool_definition
-            tool_info.update({
-                "parameters": definition.get("parameters", {}),
-                "returns": definition.get("returns", "Unknown")
-            })
+            if isinstance(definition, dict):
+                # Only include specific safe fields
+                if "parameters" in definition and isinstance(definition["parameters"], dict):
+                    tool_info["parameters"] = definition["parameters"]
+                if "parameter_descriptions" in definition and isinstance(definition["parameter_descriptions"], dict):
+                    tool_info["parameter_descriptions"] = definition["parameter_descriptions"]
+                if "description" in definition and isinstance(definition["description"], str):
+                    tool_info["description"] = definition["description"]
 
         # Try to extract parameter info from docstring
         if hasattr(tool_func, "__wrapped__"):
@@ -355,7 +389,7 @@ async def sse_list_tools():
             if hasattr(original_func, "__doc__") and original_func.__doc__:
                 # Extract first line as description
                 lines = original_func.__doc__.strip().split('\n')
-                if lines:
+                if lines and lines[0]:
                     tool_info["description"] = lines[0].strip()
 
         tool_list.append(tool_info)
